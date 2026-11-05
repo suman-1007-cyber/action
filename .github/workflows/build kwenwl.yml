@@ -1,0 +1,358 @@
+name: Build Kernel (mt6768)
+
+on:
+  workflow_dispatch:
+    inputs:
+      devices:
+        description: "Override devices (comma separated, blank = DEVICES from ksun.env)"
+        required: false
+        default: ""
+      kernelsu_tag:
+        description: "Override KERNELSU_TAG (blank = ksun.env), e.g. legacy / dev / shockwave"
+        required: false
+        default: ""
+      kernelsu_setup_source:
+        description: "Override KERNELSU_SETUP_SOURCE url (blank = ksun.env)"
+        required: false
+        default: ""
+      release:
+        description: "Publish a GitHub release"
+        type: boolean
+        default: false
+  push:
+    paths: [ "ksun.env", ".github/workflows/build.yml", "patches/**" ]
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: ksun.env, sparse-checkout-cone-mode: false }
+      - id: m
+        run: |
+          set -e
+          DEV="${{ github.event.inputs.devices }}"
+          [ -z "$DEV" ] && DEV=$(grep -E '^DEVICES=' ksun.env | cut -d= -f2-)
+          echo "matrix=$(python3 -c "import json,sys;print(json.dumps({'device':[d.strip() for d in sys.argv[1].split(',') if d.strip()]}))" "$DEV")" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Load ksun.env
+        uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - name: Parse config into env
+        run: |
+          # last-wins, strips comments/blank lines, keeps values containing '='
+          grep -E '^[A-Z0-9_]+=' ksun.env | while IFS= read -r l; do
+            k="${l%%=*}"; v="${l#*=}"
+            printf '%s<<__EOF__\n%s\n__EOF__\n' "$k" "$v" >> "$GITHUB_ENV"
+          done
+
+      - name: Apply manual KernelSU overrides
+        env:
+          IN_TAG: ${{ github.event.inputs.kernelsu_tag }}
+          IN_SRC: ${{ github.event.inputs.kernelsu_setup_source }}
+        run: |
+          if [ -n "$IN_TAG" ]; then printf 'KERNELSU_TAG<<__EOF__\n%s\n__EOF__\n' "$IN_TAG" >> "$GITHUB_ENV"; echo "KERNELSU_TAG overridden: $IN_TAG"; fi
+          if [ -n "$IN_SRC" ]; then printf 'KERNELSU_SETUP_SOURCE<<__EOF__\n%s\n__EOF__\n' "$IN_SRC" >> "$GITHUB_ENV"; echo "KERNELSU_SETUP_SOURCE overridden: $IN_SRC"; fi
+
+      - name: Checkout external kernel source
+        if: env.KERNEL_SOURCE != ''
+        run: |
+          # keep this repo's patches/ before the checkout is replaced by the kernel source
+          mkdir -p "$RUNNER_TEMP/patches" && cp -r patches/. "$RUNNER_TEMP/patches/" 2>/dev/null || true
+          rm -rf ./* .[!.]*  || true
+          git clone --depth=1 -b "$KERNEL_SOURCE_BRANCH" "$KERNEL_SOURCE" .
+
+      - name: Free disk space
+        if: env.REMOVE_UNUSED_PACKAGES == 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean; df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends bc bison flex libssl-dev libelf-dev \
+            zstd xz-utils cpio lz4 ccache dos2unix device-tree-compiler python3 zip unzip curl \
+            git make build-essential libncurses-dev binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+          if [ "$ENABLE_PYTHON2" = "true" ]; then sudo apt-get install -y python2 || true; fi
+
+      - name: Restore ccache
+        if: env.ENABLE_CCACHE == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ matrix.device }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.device }}-
+
+      - name: Fetch toolchains
+        run: |
+          mkdir -p "$HOME/tc" && cd "$HOME/tc"
+
+          # Download to a file, detect the real archive type from magic bytes, then extract.
+          # (A failed/blocked download that returns an HTML page is reported clearly instead of
+          #  dying with "xz: File format not recognized".)
+          fetch_archive() {  # url dest strip
+            local url="$1" dest="$2" strip="${3:-0}" f magic
+            mkdir -p "$dest"
+            case "$url" in
+              *.git|*/tree/*) git clone --depth=1 ${4:+-b "$4"} "$url" "$dest"; return $? ;;
+            esac
+            f=$(mktemp)
+            curl -fL --retry 5 --retry-all-errors --retry-delay 5 -o "$f" "$url" || { echo "download failed: $url"; return 1; }
+            magic=$(od -An -tx1 -N6 "$f" | tr -d ' \n')
+            echo "downloaded $(stat -c%s "$f") bytes, magic=$magic  <- $url"
+            case "$magic" in
+              fd377a585a00*) tar -xJf "$f" -C "$dest" --strip-components="$strip" ;;
+              28b52ffd*)     tar --zstd -xf "$f" -C "$dest" --strip-components="$strip" ;;
+              1f8b*)         tar -xzf "$f" -C "$dest" --strip-components="$strip" ;;
+              425a68*)       tar -xjf "$f" -C "$dest" --strip-components="$strip" ;;
+              *) echo "Not an archive. First bytes of response:"; head -c 300 "$f"; echo; return 1 ;;
+            esac
+          }
+
+          if [ "$USE_CLANG" = "true" ]; then
+            fetch_archive "$CLANG_SOURCE" clang 0 "$CLANG_BRANCH" || { echo "::error::Clang download failed"; exit 1; }
+            # flatten if the archive had one top-level dir
+            if [ ! -d clang/bin ] && [ "$(ls clang | wc -l)" = 1 ]; then mv clang/*/* clang/ 2>/dev/null || true; fi
+            test -x clang/bin/clang || { echo "::error::clang/bin/clang not found after extract"; ls -R clang | head -30; exit 1; }
+            echo "$HOME/tc/clang/bin" >> "$GITHUB_PATH"
+          fi
+
+          # GCC is only needed for the CROSS_COMPILE prefixes. If a Linaro download fails we fall back
+          # to the apt cross toolchains (gcc-aarch64-linux-gnu / gcc-arm-linux-gnueabi) installed earlier.
+          if [ "$USE_GCC_64" = "true" ]; then
+            if fetch_archive "$GCC_64_SOURCE" gcc64 1 "$GCC_64_BRANCH"; then echo "$HOME/tc/gcc64/bin" >> "$GITHUB_PATH"
+            else echo "::warning::GCC64 download failed, using apt aarch64-linux-gnu toolchain instead"; fi
+          fi
+          if [ "$USE_GCC_32" = "true" ]; then
+            if fetch_archive "$GCC_32_SOURCE" gcc32 1 "$GCC_32_BRANCH"; then echo "$HOME/tc/gcc32/bin" >> "$GITHUB_PATH"
+            else echo "::warning::GCC32 download failed, using apt arm-linux-gnueabi toolchain instead"; fi
+          fi
+
+      - name: Apply patches
+        run: |
+          shopt -s nullglob
+          PDIR=patches; [ -d "$RUNNER_TEMP/patches" ] && PDIR="$RUNNER_TEMP/patches"
+          for p in "$PDIR"/*.patch; do
+            echo ">> $p"
+            git apply --check "$p" && git apply "$p" || { echo "::warning::$p did not apply cleanly (skipped)"; }
+          done
+
+      - name: Set up KernelSU
+        if: env.ENABLE_KERNELSU == 'true'
+        run: |
+          curl -LSs "$KERNELSU_SETUP_SOURCE" -o /tmp/ksu_setup.sh
+          [ -n "$KSU_EXPECTED_HASH" ] && echo "$KSU_EXPECTED_HASH  /tmp/ksu_setup.sh" | sha256sum -c -
+          bash /tmp/ksu_setup.sh "$KERNELSU_TAG"
+          if [ "$KSU_REVERT" = "true" ]; then git checkout -- . ; fi
+          ls drivers | grep -i kernelsu || { echo "::error::KernelSU driver missing after setup"; exit 1; }
+          grep -n kernelsu drivers/Makefile drivers/Kconfig
+
+      - name: Show KernelSU driver version
+        if: env.ENABLE_KERNELSU == 'true'
+        run: |
+          KSU_DIR=$(ls -d KernelSU* 2>/dev/null | head -1)
+          if [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR/.git" ]; then
+            echo "KernelSU dir: $KSU_DIR"
+            echo "KernelSU ref: $(git -C "$KSU_DIR" rev-parse --abbrev-ref HEAD) @ $(git -C "$KSU_DIR" rev-parse --short HEAD)"
+            N=$(git -C "$KSU_DIR" rev-list --count HEAD)
+            echo "Commit count: $N  (driver version code is usually 10000-30000 + this, depending on the fork)"
+          else
+            echo "No KernelSU git dir found (drivers/kernelsu -> $(readlink drivers/kernelsu 2>/dev/null))"
+          fi
+
+      - name: KernelSU / SUSFS compat fixes
+        if: env.ENABLE_KERNELSU == 'true'
+        run: |
+          # Tree ships SUSFS v2.3.0 where try_umount was removed (deprecated),
+          # but the KernelSU fork's supercalls.c still calls susfs_add_try_umount().
+          if grep -rq 'susfs_add_try_umount' drivers/kernelsu && ! grep -q 'susfs_add_try_umount' include/linux/susfs.h; then
+            echo "Adding no-op susfs_add_try_umount() stub to include/linux/susfs.h"
+            python3 - <<'PY'
+          import re
+          p = "include/linux/susfs.h"
+          s = open(p).read()
+          stub = ("\n/* compat stub: try_umount removed in SUSFS v2.x, still referenced by KernelSU */\n"
+                  "static inline int susfs_add_try_umount(void *arg) { (void)arg; return 0; }\n")
+          i = s.rfind("#endif")
+          s = s[:i] + stub + "\n" + s[i:] if i != -1 else s + stub
+          open(p, "w").write(s)
+          PY
+          fi
+          # SUSFS v2.3.0 in this tree dropped susfs_try_umount() and made susfs_run_sus_path_loop()
+          # static (it now runs from the susfs_extra_works workqueue). Older KernelSU forks still call
+          # both from setuid_hook.c -> "undefined symbol" at link time. Provide compat shims.
+          NEED_COMPAT=0
+          for f in susfs_try_umount susfs_run_sus_path_loop; do
+            if grep -rqE "\\b$f\\b" drivers/kernelsu && ! grep -qE "^(int|void|bool)[[:space:]]+$f\\(" fs/susfs.c; then NEED_COMPAT=1; fi
+          done
+          if [ "$NEED_COMPAT" = 1 ] && [ ! -f fs/susfs_compat.c ]; then
+            echo "Adding fs/susfs_compat.c (susfs_try_umount / susfs_run_sus_path_loop shims)"
+            cat > fs/susfs_compat.c <<'EOF'
+          // SPDX-License-Identifier: GPL-2.0
+          /* Compat shims so older KernelSU forks link against SUSFS v2.x */
+          #include <linux/kernel.h>
+          #include <linux/types.h>
+          #include <linux/workqueue.h>
+
+          extern struct work_struct susfs_extra_works;
+
+          /* try_umount was removed from SUSFS v2.x (KernelSU does its own umount) */
+          void susfs_try_umount(uid_t uid)
+          {
+          }
+
+          /* In SUSFS v2.x the sus_path_loop runs from a workqueue instead of inline */
+          void susfs_run_sus_path_loop(uid_t uid)
+          {
+          	if (susfs_extra_works.func)
+          		schedule_work(&susfs_extra_works);
+          }
+          EOF
+            grep -q susfs_compat fs/Makefile || sed -i '/^obj-\$(CONFIG_KSU_SUSFS) += susfs\.o/a obj-$(CONFIG_KSU_SUSFS) += susfs_compat.o' fs/Makefile
+            grep -n susfs fs/Makefile
+          fi
+          # Diagnostic: SUSFS functions KernelSU calls that the tree does not declare
+          grep -rhoE '\bsusfs_[a-z0-9_]+\(' drivers/kernelsu | tr -d '(' | sort -u | while read -r f; do
+            grep -qE "\b$f\b" include/linux/susfs.h || echo "::warning::KernelSU uses $f but include/linux/susfs.h does not declare it"
+          done
+
+      - name: SUSFS wiring report
+        if: env.ENABLE_KERNELSU == 'true'
+        continue-on-error: true
+        run: |
+          {
+            echo "# SUSFS wiring report  (KernelSU tag: $KERNELSU_TAG)"
+            echo "Tree SUSFS: $(grep -ho 'SUSFS_VERSION "[^"]*"' include/linux/susfs.h)"
+            KSU_DIR=$(ls -d KernelSU* 2>/dev/null | head -1); echo "KernelSU ref: $(git -C "$KSU_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null) @ $(git -C "$KSU_DIR" rev-parse --short HEAD 2>/dev/null)"
+            echo
+            echo "## KernelSU driver files mentioning susfs"
+            grep -rIl -i susfs drivers/kernelsu/ 2>/dev/null || echo "(none)"
+            echo
+            echo "## KSU_SUSFS Kconfig symbols provided by the driver"
+            grep -rhn '^config KSU_SUSFS' drivers/kernelsu/ 2>/dev/null || echo "(none)"
+            echo
+            echo "## Tree SUSFS commands handled by the KernelSU driver  [x]=handled  [ ]=missing"
+            for c in $(grep -oE 'CMD_SUSFS_[A-Z_0-9]+' include/linux/susfs_def.h | sort -u); do
+              if grep -rqw "$c" drivers/kernelsu/ 2>/dev/null; then echo "  [x] $c"; else echo "  [ ] $c"; fi
+            done
+            echo
+            echo "## Where the driver answers SHOW_VERSION"
+            grep -rn 'SHOW_VERSION\|susfs_show_version' drivers/kernelsu/ 2>/dev/null | head -5 || true
+            echo
+            echo "## susfs_* functions the driver calls but tree does not define in fs/susfs.c"
+            grep -rhoE '\bsusfs_[a-z0-9_]+\(' drivers/kernelsu/ 2>/dev/null | tr -d '(' | sort -u | while read -r f; do
+              grep -qE "\b$f\(" fs/susfs.c || echo "  $f"
+            done
+          } > susfs_report.txt
+          cat susfs_report.txt
+          cat susfs_report.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build kernel
+        run: |
+          set -eo pipefail
+          KVER="$LOCALVERSION"; unset LOCALVERSION
+          export ARCH="$KERNEL_ARCH" SUBARCH="$KERNEL_ARCH"
+          [ "$ENABLE_CCACHE" = "true" ] && { export CCACHE_DIR=$HOME/.ccache; ccache -M 5G; CC_PREFIX="ccache clang"; } || CC_PREFIX="clang"
+
+          # shellcheck disable=SC2206
+          # NOTE: do NOT pass LOCALVERSION= on the make line, it gets appended on top of CONFIG_LOCALVERSION (name doubled)
+          EXTRA=( $EXTRA_CMDS )
+          MK=( make -j"$(nproc)" O=out ARCH=arm64 CC="$CC_PREFIX" "${EXTRA[@]}" )
+
+          # defconfig + per-device fragment (kernel 4.19 merges *.config fragments)
+          "${MK[@]}" "$KERNEL_CONFIG_BASE"
+          "${MK[@]}" "${KERNEL_CONFIG_FRAGMENT_DIR:+$KERNEL_CONFIG_FRAGMENT_DIR/}${{ matrix.device }}.config"
+
+          # post-merge tweaks through scripts/config
+          C="scripts/config --file out/.config"
+          [ "$ENABLE_KERNELSU" = "true" ] && $C -e KSU
+          [ "$ADD_KPROBES_CONFIG" = "true" ] && $C -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
+          [ "$ADD_OVERLAYFS_CONFIG" = "true" ] && $C -e OVERLAY_FS
+          [ "$ADD_APATCH_SUPPORT" = "true" ] && $C -e KALLSYMS -e KALLSYMS_ALL
+          [ "$DISABLE_LTO" = "true" ] && $C -d LTO_CLANG -d CFI_CLANG -d SHADOW_CALL_STACK -e LTO_NONE
+          [ "$DISABLE_CC_WERROR" = "true" ] && $C -d CC_WERROR || true
+
+          # --- QoL feature tweaks (toggles live in ksun.env; all built in, AnyKernel3 ships no modules) ---
+          if [ "$ENABLE_BBR_FQ" = "true" ]; then
+            # BBR as default congestion control, fq as default qdisc (both are 'choice' symbols,
+            # so the old members are switched off explicitly)
+            $C -e TCP_CONG_ADVANCED -e TCP_CONG_BBR -d DEFAULT_CUBIC -d DEFAULT_BIC -e DEFAULT_BBR
+            $C -e NET_SCHED -e NET_SCH_FQ -e NET_SCH_DEFAULT \
+               -d DEFAULT_PFIFO_FAST -d DEFAULT_FQ_CODEL -d DEFAULT_SFQ -d DEFAULT_CODEL -e DEFAULT_FQ
+          fi
+          [ "$ENABLE_BFQ" = "true" ] && $C -e IOSCHED_BFQ || true
+          [ "$ENSURE_EXTRA_FEATURES" = "true" ] && $C -e WIREGUARD -e PSI -d PSI_DEFAULT_DISABLED -e EXFAT_FS || true
+          [ "$DISABLE_DEBUG_OPTIONS" = "true" ] && $C -d CFG80211_DEVELOPER_WARNINGS -d SCHEDSTATS || true
+
+          $C --set-str LOCALVERSION "$KVER"
+          "${MK[@]}" olddefconfig
+
+          # --- verify the tweaks survived olddefconfig (fail now, not after a 20 minute compile) ---
+          CFGBAD=0
+          want() { grep -qx "$1" out/.config || { echo "::error::expected '$1' in out/.config (a dependency probably overrode it)"; CFGBAD=1; }; }
+          unwant() { if grep -qx "$1" out/.config; then echo "::error::'$1' is still set in out/.config"; CFGBAD=1; fi; }
+          if [ "$ENABLE_BBR_FQ" = "true" ]; then want CONFIG_TCP_CONG_BBR=y; want CONFIG_NET_SCH_FQ=y; want 'CONFIG_DEFAULT_TCP_CONG="bbr"'; want 'CONFIG_DEFAULT_NET_SCH="fq"'; fi
+          if [ "$ENABLE_BFQ" = "true" ]; then want CONFIG_IOSCHED_BFQ=y; fi
+          if [ "$ENSURE_EXTRA_FEATURES" = "true" ]; then want CONFIG_WIREGUARD=y; want CONFIG_PSI=y; want CONFIG_EXFAT_FS=y; unwant CONFIG_PSI_DEFAULT_DISABLED=y; fi
+          if [ "$DISABLE_DEBUG_OPTIONS" = "true" ]; then unwant CONFIG_CFG80211_DEVELOPER_WARNINGS=y; unwant CONFIG_SCHEDSTATS=y; fi
+          # guard rail: the MediaTek Wi-Fi driver uses NL80211_TESTMODE, it must stay on
+          grep -qx CONFIG_NL80211_TESTMODE=y out/.config || echo "::warning::CONFIG_NL80211_TESTMODE is not enabled; the MediaTek Wi-Fi driver may lose features"
+          {
+            echo "### Config tweaks (${{ matrix.device }})"
+            echo '```'
+            grep -E '^(# )?CONFIG_(TCP_CONG_BBR|NET_SCH_FQ|DEFAULT_TCP_CONG|DEFAULT_NET_SCH|IOSCHED_BFQ|MQ_IOSCHED_KYBER|MQ_IOSCHED_DEADLINE|WIREGUARD|PSI|EXFAT_FS|CFG80211_DEVELOPER_WARNINGS|SCHEDSTATS|NL80211_TESTMODE)[= ]' out/.config
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$CFGBAD" = "0" ] || exit 1
+
+          # build
+          "${MK[@]}" 2>&1 | tee out/build.log
+          test -f "out/arch/arm64/boot/$KERNEL_IMAGE_NAME" || { echo "::error::$KERNEL_IMAGE_NAME not produced"; tail -n 60 out/build.log; exit 1; }
+
+      - name: Package with AnyKernel3
+        run: |
+          git clone --depth=1 -b "$ANYKERNEL3_BRANCH" "$ANYKERNEL3_SOURCE" AK3
+          cp "out/arch/arm64/boot/$KERNEL_IMAGE_NAME" AK3/
+          if [ "$NEED_DTBO" = "true" ] && [ -f out/arch/arm64/boot/dtbo.img ]; then cp out/arch/arm64/boot/dtbo.img AK3/; fi
+          cd AK3 && rm -rf .git
+          NAME="FinELikEWinE_69-${{ matrix.device }}-$(date +%Y%m%d)"
+          zip -r9 "../$NAME.zip" . -x '*.git*' README.md
+          echo "ZIP_NAME=$NAME" >> "$GITHUB_ENV"
+
+      - name: Upload flashable zip (no extra zip)
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ env.ZIP_NAME }}.zip
+          archive: false
+          if-no-files-found: error
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: logs-${{ matrix.device }}
+          path: |
+            out/build.log
+            susfs_report.txt
+          if-no-files-found: ignore
+
+      - name: Release
+        if: github.event.inputs.release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          files: ${{ env.ZIP_NAME }}.zip
