@@ -287,13 +287,18 @@ jobs:
           [ "$DISABLE_CC_WERROR" = "true" ] && $C -d CC_WERROR || true
 
           # --- QoL feature tweaks (toggles live in ksun.env; all built in, AnyKernel3 ships no modules) ---
-          if [ "$ENABLE_BBR_FQ" = "true" ]; then
-            # BBR as default congestion control, fq as default qdisc (both are 'choice' symbols,
-            # so the old members are switched off explicitly)
-            $C -e TCP_CONG_ADVANCED -e TCP_CONG_BBR -d DEFAULT_CUBIC -d DEFAULT_BIC -e DEFAULT_BBR
-            $C -e NET_SCHED -e NET_SCH_FQ -e NET_SCH_DEFAULT \
-               -d DEFAULT_PFIFO_FAST -d DEFAULT_FQ_CODEL -d DEFAULT_SFQ -d DEFAULT_CODEL -e DEFAULT_FQ
-          fi
+          # ENABLE_BBR_FQ: default (or true) = BBR + fq become the system defaults
+          #                available            = BBR + fq are compiled in but the defaults stay cubic + pfifo_fast
+          #                false                = untouched
+          case "$ENABLE_BBR_FQ" in
+            true|default)
+              # both defaults are 'choice' symbols, so the old members are switched off explicitly
+              $C -e TCP_CONG_ADVANCED -e TCP_CONG_BBR -d DEFAULT_CUBIC -d DEFAULT_BIC -e DEFAULT_BBR
+              $C -e NET_SCHED -e NET_SCH_FQ -e NET_SCH_DEFAULT \
+                 -d DEFAULT_PFIFO_FAST -d DEFAULT_FQ_CODEL -d DEFAULT_SFQ -d DEFAULT_CODEL -e DEFAULT_FQ ;;
+            available)
+              $C -e TCP_CONG_ADVANCED -e TCP_CONG_BBR -e NET_SCHED -e NET_SCH_FQ ;;
+          esac
           [ "$ENABLE_BFQ" = "true" ] && $C -e IOSCHED_BFQ || true
           [ "$ENSURE_EXTRA_FEATURES" = "true" ] && $C -e WIREGUARD -e PSI -d PSI_DEFAULT_DISABLED -e EXFAT_FS || true
           [ "$DISABLE_DEBUG_OPTIONS" = "true" ] && $C -d CFG80211_DEVELOPER_WARNINGS -d SCHEDSTATS || true
@@ -305,7 +310,10 @@ jobs:
           CFGBAD=0
           want() { grep -qx "$1" out/.config || { echo "::error::expected '$1' in out/.config (a dependency probably overrode it)"; CFGBAD=1; }; }
           unwant() { if grep -qx "$1" out/.config; then echo "::error::'$1' is still set in out/.config"; CFGBAD=1; fi; }
-          if [ "$ENABLE_BBR_FQ" = "true" ]; then want CONFIG_TCP_CONG_BBR=y; want CONFIG_NET_SCH_FQ=y; want 'CONFIG_DEFAULT_TCP_CONG="bbr"'; want 'CONFIG_DEFAULT_NET_SCH="fq"'; fi
+          case "$ENABLE_BBR_FQ" in
+            true|default) want CONFIG_TCP_CONG_BBR=y; want CONFIG_NET_SCH_FQ=y; want 'CONFIG_DEFAULT_TCP_CONG="bbr"'; want 'CONFIG_DEFAULT_NET_SCH="fq"';;
+            available)    want CONFIG_TCP_CONG_BBR=y; want CONFIG_NET_SCH_FQ=y; unwant CONFIG_DEFAULT_BBR=y; unwant CONFIG_DEFAULT_FQ=y;;
+          esac
           if [ "$ENABLE_BFQ" = "true" ]; then want CONFIG_IOSCHED_BFQ=y; fi
           if [ "$ENSURE_EXTRA_FEATURES" = "true" ]; then want CONFIG_WIREGUARD=y; want CONFIG_PSI=y; want CONFIG_EXFAT_FS=y; unwant CONFIG_PSI_DEFAULT_DISABLED=y; fi
           if [ "$DISABLE_DEBUG_OPTIONS" = "true" ]; then unwant CONFIG_CFG80211_DEVELOPER_WARNINGS=y; unwant CONFIG_SCHEDSTATS=y; fi
@@ -329,7 +337,7 @@ jobs:
           cp "out/arch/arm64/boot/$KERNEL_IMAGE_NAME" AK3/
           if [ "$NEED_DTBO" = "true" ] && [ -f out/arch/arm64/boot/dtbo.img ]; then cp out/arch/arm64/boot/dtbo.img AK3/; fi
           cd AK3 && rm -rf .git
-          NAME="FinELikEWinE_69-${{ matrix.device }}-$(TZ=Asia/Kolkata date +%Y%m%d-%H%M)"
+          NAME="FinELikEWinE_69-${{ matrix.device }}-$(date +%Y%m%d)"
           zip -r9 "../$NAME.zip" . -x '*.git*' README.md
           echo "ZIP_NAME=$NAME" >> "$GITHUB_ENV"
 
