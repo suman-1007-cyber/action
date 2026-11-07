@@ -313,6 +313,7 @@ jobs:
           case "$ENABLE_BBR_FQ" in
             true|default) want CONFIG_TCP_CONG_BBR=y; want CONFIG_NET_SCH_FQ=y; want 'CONFIG_DEFAULT_TCP_CONG="bbr"'; want 'CONFIG_DEFAULT_NET_SCH="fq"';;
             available)    want CONFIG_TCP_CONG_BBR=y; want CONFIG_NET_SCH_FQ=y; unwant CONFIG_DEFAULT_BBR=y; unwant CONFIG_DEFAULT_FQ=y;;
+            *)            unwant CONFIG_TCP_CONG_BBR=y; unwant CONFIG_DEFAULT_BBR=y; unwant CONFIG_DEFAULT_FQ=y;;
           esac
           if [ "$ENABLE_BFQ" = "true" ]; then want CONFIG_IOSCHED_BFQ=y; fi
           if [ "$ENSURE_EXTRA_FEATURES" = "true" ]; then want CONFIG_WIREGUARD=y; want CONFIG_PSI=y; want CONFIG_EXFAT_FS=y; unwant CONFIG_PSI_DEFAULT_DISABLED=y; fi
